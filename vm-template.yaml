@@ -1,0 +1,99 @@
+#cloud-config
+autoinstall:
+  version: 1
+  shutdown: poweroff
+
+  locale: en_US.UTF-8
+  keyboard:
+    layout: us
+
+  identity:
+    hostname: ${{HOSTNAME}}
+    username: ${{USERNAME}}
+    password: ${{USER_PASSWORD}}
+
+  ssh:
+    install-server: true
+    allow-pw: false
+    ssh_import_id:
+      - gh:${{GH_USERNAME}}
+
+  storage:
+    layout:
+      name: direct
+
+  packages:
+    - curl
+    - wget
+    - ca-certificates
+    - jq
+    - git
+    - socat
+    - conntrack
+    - qemu-guest-agent
+    - openssh-server
+    - cloud-init
+    - ssh-import-id
+
+  late-commands:
+    - curtin in-target --target=/target -- /bin/bash -c 'curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.noarmor.gpg | tee /usr/share/keyrings/tailscale-archive-keyring.gpg >/dev/null'
+    - curtin in-target --target=/target -- /bin/bash -c 'curl -fsSL https://pkgs.tailscale.com/stable/ubuntu/noble.tailscale-keyring.list | tee /etc/apt/sources.list.d/tailscale.list'
+    - curtin in-target --target=/target -- apt-get update
+    - curtin in-target --target=/target -- apt-get install -y tailscale
+    - curtin in-target --target=/target -- /bin/bash -c 'if [ -n "${{TAILSCALE_AUTH_KEY}}" ]; then install -d -m 700 /etc/tailscale && printf "%s" "${{TAILSCALE_AUTH_KEY}}" > /etc/tailscale/authkey && chmod 600 /etc/tailscale/authkey; fi'
+    - |
+      curtin in-target --target=/target -- /bin/bash -c 'cat > /etc/systemd/system/tailscale-setup.service <<EOF
+      [Unit]
+      Description=Register node to Tailscale tailnet (first boot)
+      After=tailscaled.service network-online.target
+      Wants=network-online.target
+      ConditionPathExists=/etc/tailscale/authkey
+
+      [Service]
+      Type=oneshot
+      ExecStart=/usr/bin/tailscale up --authkey=file:/etc/tailscale/authkey --hostname=${{HOSTNAME}}
+      ExecStartPost=/bin/rm -f /etc/tailscale/authkey
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF'
+    - curtin in-target --target=/target -- systemctl enable tailscale-setup.service
+    - curtin in-target --target=/target -- systemctl enable qemu-guest-agent.service
+    - curtin in-target --target=/target -- systemctl start qemu-guest-agent.service
+    - curtin in-target -- echo "Autoinstall complete" > /root/autoinstall-done
+    - |
+      curtin in-target --target=/target -- /bin/bash -c 'cat > /etc/systemd/system/report-ip-to-serial.service <<EOF
+      [Unit]
+      Description=Report IP addresses to the serial console (one-shot)
+      After=network-online.target
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      ExecStart=/bin/sh -c "sleep 5; ip -4 -o addr show scope global | awk '\''{print \$4 \" \" \$2}'\'' | sed '\''s/ /\\t/'\'' | tee /var/log/first-boot-ip.txt | awk '\''{print \"IP_ADDRESS=\" \$1 }'\'' > /dev/ttyS0"
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF'
+    - curtin in-target --target=/target -- systemctl enable report-ip-to-serial.service
+    - |
+      curtin in-target --target=/target -- /bin/bash -c 'cat > /etc/systemd/system/ssh-import-keys.service <<EOF
+      [Unit]
+      Description=Import SSH keys from GitHub on first boot
+      After=network-online.target
+      Wants=network-online.target
+      ConditionPathExists=!/home/${{USERNAME}}/.ssh/ssh-import-done
+
+      [Service]
+      Type=oneshot
+      User=${{USERNAME}}
+      ExecStart=/usr/bin/ssh-import-id gh:tedwardd
+      ExecStartPost=/usr/bin/touch /home/${{USERNAME}}/.ssh/ssh-import-done
+      RemainAfterExit=yes
+
+      [Install]
+      WantedBy=multi-user.target
+      EOF'
+    - curtin in-target --target=/target -- systemctl enable ssh-import-keys.service
