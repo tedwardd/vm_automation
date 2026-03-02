@@ -21,6 +21,8 @@ autoinstall:
   storage:
     layout:
       name: direct
+      match:
+        path: /dev/vda
 
   packages:
     - curl

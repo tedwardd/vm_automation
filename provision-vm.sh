@@ -7,9 +7,13 @@ MEMORY="2048"
 VCPUS="2"
 DISK_SIZE="20"
 OS_ISO="/tank/isos/ubuntu-24.04.3-live-server-amd64.iso"
-CLOUD_INIT_FILE="$(dirname "$(realpath "$0")")/vm-template.yaml"
+CLOUD_INIT_FILE="$(dirname "$(realpath "$0")")/templates/vm-template.yaml"
 DISK_PATH="/tank/kvm"
 TAILSCALE_AUTH_KEY="${TAILSCALE_AUTH_KEY:-}"
+VM_USERNAME="${VM_USERNAME:-}"
+VM_PASSWORD="${VM_PASSWORD:-}"
+GH_USERNAME="${GH_USERNAME:-}"
+ZVOLS=()
 
 usage() {
     cat <<EOF
@@ -27,15 +31,24 @@ Optional:
   -k, --tailscale-auth-key KEY
                             Tailscale pre-auth key for automatic tailnet registration
                             (can also be set via TAILSCALE_AUTH_KEY env var)
+  -u, --username USER       OS username
+                            (can also be set via VM_USERNAME env var)
+  -P, --password HASH       Hashed password for OS user (SHA-512)
+                            (can also be set via VM_PASSWORD env var)
+      --gh-username USER    GitHub username for SSH key import
+                            (can also be set via GH_USERNAME env var)
   -m, --memory MB           Memory in MB (default: 2048)
   -v, --vcpus NUM           Number of vCPUs (default: 2)
   -d, --disk-size GB        Disk size in GB (default: 20)
   -p, --disk-path PATH      Directory for VM disk (default: /tank/kvm)
+      --zvol DATASET        ZFS zvol dataset to attach as additional block device
+                            (e.g. tank/mydata → /dev/zvol/tank/mydata). Repeatable.
   -h, --help                Show this help message
 
-Example:
+Examples:
   $(basename "$0") -n myvm -i ubuntu-22.04.iso -c cloud-init.yaml -m 4096 -v 4 -d 50
   $(basename "$0") -n myvm -c vm-template.yaml -k tskey-auth-xxx...
+  $(basename "$0") -n myvm -u alice -P "\$(openssl passwd -6 secret)" --gh-username alice -k tskey-auth-xxx...
 EOF
     exit 1
 }
@@ -75,6 +88,18 @@ while [[ $# -gt 0 ]]; do
             TAILSCALE_AUTH_KEY="$2"
             shift 2
             ;;
+        -u|--username)
+            VM_USERNAME="$2"
+            shift 2
+            ;;
+        -P|--password)
+            VM_PASSWORD="$2"
+            shift 2
+            ;;
+        --gh-username)
+            GH_USERNAME="$2"
+            shift 2
+            ;;
         -m|--memory)
             MEMORY="$2"
             shift 2
@@ -89,6 +114,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -p|--disk-path)
             DISK_PATH="$2"
+            shift 2
+            ;;
+        --zvol)
+            ZVOLS+=("$2")
             shift 2
             ;;
         -h|--help)
@@ -106,6 +135,11 @@ done
 # Validate files exist
 [[ ! -f "$OS_ISO" ]] && error "OS ISO not found: $OS_ISO"
 [[ -n "$CLOUD_INIT_FILE" && ! -f "$CLOUD_INIT_FILE" ]] && error "Cloud-init file not found: $CLOUD_INIT_FILE"
+
+# Validate zvol block devices exist
+for zvol in "${ZVOLS[@]}"; do
+    [[ -b "/dev/zvol/$zvol" ]] || error "Zvol block device not found: /dev/zvol/$zvol"
+done
 
 # Check for required tools
 for cmd in virt-install genisoimage virsh qemu-img; do
@@ -142,6 +176,25 @@ if [[ -n "$CLOUD_INIT_FILE" ]]; then
         log "         Tailscale will not be automatically registered. Use -k or TAILSCALE_AUTH_KEY env var."
     fi
     sed -i "s|\\\${{TAILSCALE_AUTH_KEY}}|${TAILSCALE_AUTH_KEY}|g" "$CIDATA_DIR/user-data"
+
+    # USERNAME
+    if [[ -z "$VM_USERNAME" ]] && grep -qF '${{USERNAME}}' "$CIDATA_DIR/user-data" 2>/dev/null; then
+        error "Template contains \${{USERNAME}} but no username was provided. Use -u or VM_USERNAME env var."
+    fi
+    sed -i "s|\\\${{USERNAME}}|${VM_USERNAME}|g" "$CIDATA_DIR/user-data"
+
+    # USER_PASSWORD
+    if [[ -z "$VM_PASSWORD" ]] && grep -qF '${{USER_PASSWORD}}' "$CIDATA_DIR/user-data" 2>/dev/null; then
+        error "Template contains \${{USER_PASSWORD}} but no password was provided. Use -P or VM_PASSWORD env var."
+    fi
+    sed -i "s|\\\${{USER_PASSWORD}}|${VM_PASSWORD}|g" "$CIDATA_DIR/user-data"
+
+    # GH_USERNAME
+    if [[ -z "$GH_USERNAME" ]] && grep -qF '${{GH_USERNAME}}' "$CIDATA_DIR/user-data" 2>/dev/null; then
+        log "WARNING: Template contains \${{GH_USERNAME}} but no GitHub username was provided."
+        log "         SSH keys will not be imported from GitHub. Use --gh-username or GH_USERNAME env var."
+    fi
+    sed -i "s|\\\${{GH_USERNAME}}|${GH_USERNAME}|g" "$CIDATA_DIR/user-data"
 
     # Create meta-data
     cat > "$CIDATA_DIR/meta-data" <<EOF
@@ -201,6 +254,11 @@ VIRT_INSTALL_ARGS=(
     --channel unix,target.type=virtio,target.name=org.qemu.guest_agent.0
     --noautoconsole
 )
+
+# Add zvol block devices (always; cloud-init template pins install target to /dev/vda)
+for zvol in "${ZVOLS[@]}"; do
+    VIRT_INSTALL_ARGS+=(--disk "path=/dev/zvol/${zvol},format=raw")
+done
 
 # Add cloud-init seed ISO if provided
 if [[ -n "$SEED_ISO_FINAL" ]]; then
